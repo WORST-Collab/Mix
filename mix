@@ -301,6 +301,7 @@ CONFIG.PVF_BASE                    = "https://pvfinder.onrender.com"
 CONFIG.PVF_RECHECK                 = true   -- confirm vanished eggs (~5.5s extra on servers with eggs)
 CONFIG.PVF_INCLUDE_TARGET_RARITIES = false  -- also send every Secret/Eternal/Divine egg to PVFinder
 CONFIG.PVF_MAX_WAIT                = 14     -- never let PVFinder stall a hop longer than this
+CONFIG.PVF_TOP_ONLY                = true   -- PVFinder only receives Secret / Eternal / Divine eggs (everything else goes to your relay only)
 CONFIG.RELAY_ONLY                  = true   -- true = join ONLY servers your relay says are free (PVFinder is not asked)
 CONFIG.DISCORD_WEBHOOK             = "https://discord.com/api/webhooks/1553898268226887855/fG9vg0e9vhb_dUCi0xWqNzYr5-2w8QwelJ282YrUZWI7KPrjdH3V8gqmG7JX7zqSPHEP"     -- one webhook fills every empty Discord route
 do
@@ -4090,12 +4091,14 @@ do
 			local zone = P.resolveZone(rec.AreaId)
 			local rar = tostring(hit.rarity or ""):lower()
 			local include
-			if zone == "Alien" then
+			if CONFIG.PVF_TOP_ONLY ~= false then
+				include = (rar == "secret" or rar == "eternal" or rar == "divine")
+			elseif zone == "Alien" then
 				include = (rar == "secret" or rar == "eternal" or rar == "divine")
 			else
 				include = P.CATALOG[P.nameKey(hit.name)] == true
 			end
-			if not include and CONFIG.PVF_INCLUDE_TARGET_RARITIES == true and hit.rare then include = true end
+			if not include and CONFIG.PVF_TOP_ONLY == false and CONFIG.PVF_INCLUDE_TARGET_RARITIES == true and hit.rare then include = true end
 			local uid = tostring(rec.Uid or "")
 			if zone and include and uid ~= "" then
 				local mut = mutationText(hit)
@@ -4121,7 +4124,14 @@ do
 			local okH, hh = pcall(halloweenScan)
 			if okH and type(hh) == "table" then
 				for _, hit in ipairs(hh) do
-					if P.CATALOG[P.nameKey(hit.name)] and hit.uid then
+					local hrar = tostring(hit.rarity or ""):lower()
+					local want
+					if CONFIG.PVF_TOP_ONLY ~= false then
+						want = (hrar == "secret" or hrar == "eternal" or hrar == "divine")
+					else
+						want = P.CATALOG[P.nameKey(hit.name)] == true
+					end
+					if want and hit.uid then
 						local cash = sane(tonumber(hit.earn), 1e-12)
 						items[#items + 1] = {
 							place_id = P.PLACE, server_id = game.JobId,
