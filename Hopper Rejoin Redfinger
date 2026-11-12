@@ -298,7 +298,7 @@ CONFIG.LAGGY_PENALTY               = 20     -- listed-ping over LIST_PING_SKIP: 
 CONFIG.ONLY_LIVE_STATES            = true   -- count only eggs in the Slot / Dropped state
 CONFIG.PVF_ENABLED                 = true   -- false = never talk to PVFinder
 CONFIG.PVF_BASE                    = "https://remake-pv.onrender.com"
-CONFIG.PVF_BASE_2                  = "https://pvfinder.onrender.com"   -- second PVFinder site (old); "" = off
+CONFIG.PVF_BASE_2                  = ""   -- second PVFinder site: OFF (only the remake site gets data)
 CONFIG.PVF_RECHECK                 = false   -- confirm vanished eggs (~5.5s extra on servers with eggs)
 CONFIG.PVF_INCLUDE_TARGET_RARITIES = false  -- also send every Secret/Eternal/Divine egg to PVFinder
 CONFIG.PVF_MAX_WAIT                = 2     -- never let PVFinder stall a hop longer than this
