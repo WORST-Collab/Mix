@@ -631,6 +631,103 @@ local function jsonDecode(text)
 	return nil
 end
 
+-- ------------------------------------------------------------------ game-id presence (testing)
+-- Every account keeps ONE message in a webhook showing its username + current
+-- game id, and edits that message whenever it lands in a different server.
+--   PlaceId == PRESENCE_PLACE  -> PRESENCE_HOOK_MATCH
+--   any other place            -> PRESENCE_HOOK_OTHER
+-- If the account moves between the two groups, the old message is deleted.
+do
+local PRESENCE_ON = true
+local PRESENCE_PLACE = 107778070777162
+local PRESENCE_HOOK_MATCH = "https://discord.com/api/webhooks/1570332075926753360/GMpIeTvmfKJldBPG02-l7UXPkqUqFYukZ65-D4vTLy8BQ5XYCVmmmk-7PkKoWbjWUeKg"
+local PRESENCE_HOOK_OTHER = "https://discord.com/api/webhooks/1570331825065168906/-7KTLkLS9IkCpMSuws6ETy8U_hDwTgucQlfJBXQMrzG4M9cm5XDWbaiZ0N_9Q1gc1wEk"
+
+do
+	local okC, C = pcall(function() return getgenv().EGG_CONFIG end)
+	if okC and type(C) == "table" then
+		if C.PRESENCE_ON ~= nil then PRESENCE_ON = C.PRESENCE_ON and true or false end
+		if C.PRESENCE_PLACE then PRESENCE_PLACE = tonumber(C.PRESENCE_PLACE) or PRESENCE_PLACE end
+		if type(C.PRESENCE_HOOK_MATCH) == "string" and C.PRESENCE_HOOK_MATCH ~= "" then PRESENCE_HOOK_MATCH = C.PRESENCE_HOOK_MATCH end
+		if type(C.PRESENCE_HOOK_OTHER) == "string" and C.PRESENCE_HOOK_OTHER ~= "" then PRESENCE_HOOK_OTHER = C.PRESENCE_HOOK_OTHER end
+	end
+end
+
+if PRESENCE_ON and httpRequest then
+	task.spawn(function()
+		local FILE = ("egg-grabber-presence-%s.txt"):format(tostring(ACCT_TAG))
+		local state = { which = nil, id = nil }   -- which webhook holds our message, and its message id
+		do
+			local c = safeRead(FILE)
+			if c then
+				local w, id = c:match("^(%a+)|(%d+)")
+				if w and id then state.which, state.id = w, id end
+			end
+		end
+		local function save()
+			safeWrite(FILE, state.which and state.id and (state.which .. "|" .. state.id) or "")
+		end
+		local function hookOf(which) return which == "match" and PRESENCE_HOOK_MATCH or PRESENCE_HOOK_OTHER end
+		local function req(method, url, body)
+			for attempt = 1, 2 do
+				local ok, res = pcall(httpRequest, {
+					Url = url, Method = method,
+					Headers = { ["Content-Type"] = "application/json" },
+					Body = body,
+				})
+				if not ok or type(res) ~= "table" then return nil end
+				local code = tonumber(res.StatusCode) or 0
+				if code == 429 and attempt == 1 then          -- rate limited: wait what Discord says, once
+					local d = res.Body and jsonDecode(res.Body)
+					task.wait(math.min(10, (d and tonumber(d.retry_after)) or 2) + math.random())
+				else
+					return res, code
+				end
+			end
+			return nil
+		end
+
+		local lastJob, lastPlace = nil, nil
+		local function push()
+			local place, job = game.PlaceId, game.JobId
+			local which = (tonumber(place) == tonumber(PRESENCE_PLACE)) and "match" or "other"
+			local who = tostring(game:GetService("Players").LocalPlayer and game:GetService("Players").LocalPlayer.Name or ACCT_TAG)
+			-- moved to the other group: remove the old message there
+			if state.id and state.which and state.which ~= which then
+				req("DELETE", hookOf(state.which) .. "/messages/" .. state.id)
+				state.which, state.id = nil, nil
+				save()
+			end
+			local body = jsonEncode({
+				content = ("**%s**\nplace `%s`\ngame id `%s`\nupdated <t:%d:R>"):format(who, tostring(place), tostring(job), os.time()),
+				allowed_mentions = { parse = {} },
+			})
+			if not body then return end
+			if state.id then
+				local res, code = req("PATCH", hookOf(which) .. "/messages/" .. state.id, body)
+				if res and code >= 200 and code < 300 then return end
+				if code ~= 404 and code ~= 0 and res then return end   -- other error: try again next change
+				state.which, state.id = nil, nil                          -- message was deleted: post a new one
+			end
+			local res, code = req("POST", hookOf(which) .. "?wait=true", body)
+			if res and code >= 200 and code < 300 and res.Body then
+				local d = jsonDecode(res.Body)
+				if d and d.id then state.which, state.id = which, tostring(d.id); save() end
+			end
+		end
+
+		task.wait(math.random() * 5)          -- spread 200 accounts out so one webhook isn't hit at once
+		while true do
+			if game.JobId ~= lastJob or game.PlaceId ~= lastPlace then
+				lastJob, lastPlace = game.JobId, game.PlaceId
+				pcall(push)
+			end
+			task.wait(5)
+		end
+	end)
+end
+end
+
 -- ------------------------------------------------------------------ teleport queue
 
 local function queueOnTeleport(code)
@@ -3582,11 +3679,16 @@ local function main()
 	-- Report anything already sitting here first, and wait for the post to
 	-- actually go through (webhook cooldown included), so the ping hop below
 	-- never skips eggs on this server.
+	-- PVFinder upload starts FIRST, in the background, so a slow/failed Discord
+	-- post (30s cooldown retries) can never delay it past the egg being stolen.
+	local pvDone = false
+	task.spawn(function()
+		if CONFIG.pvfReport then pcall(CONFIG.pvfReport, assets, eggState) end
+		pvDone = true
+	end)
 	flushEggs(assets, eggState)
-
-	-- PVFinder: snapshot of this server (all your accounts share its visited list).
-	-- Bounded by PVF_MAX_WAIT, so a slow / cold PVFinder can never stall the hop.
-	if CONFIG.pvfReport then pcall(CONFIG.pvfReport, assets, eggState) end
+	local pvT0 = os.clock()
+	while not pvDone and os.clock() - pvT0 < 6 do task.wait(0.1) end
 
 	-- Halloween Dimension: purely additive reporting. Its eggs are (almost)
 	-- always up, so the result is ignored and never gates a hop - and nothing
