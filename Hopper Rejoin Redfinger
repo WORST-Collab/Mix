@@ -297,7 +297,8 @@ CONFIG.LIST_MAX_PLAYING            = 5
 CONFIG.LAGGY_PENALTY               = 20     -- listed-ping over LIST_PING_SKIP: ranked lower, not skipped
 CONFIG.ONLY_LIVE_STATES            = true   -- count only eggs in the Slot / Dropped state
 CONFIG.PVF_ENABLED                 = true   -- false = never talk to PVFinder
-CONFIG.PVF_BASE                    = "https://pvfinder.onrender.com"
+CONFIG.PVF_BASE                    = "https://remake-pv.onrender.com"
+CONFIG.PVF_BASE_2                  = "https://pvfinder.onrender.com"   -- second PVFinder site (old); "" = off
 CONFIG.PVF_RECHECK                 = false   -- confirm vanished eggs (~5.5s extra on servers with eggs)
 CONFIG.PVF_INCLUDE_TARGET_RARITIES = false  -- also send every Secret/Eternal/Divine egg to PVFinder
 CONFIG.PVF_MAX_WAIT                = 2     -- never let PVFinder stall a hop longer than this
@@ -3944,339 +3945,369 @@ end
 --   Every call is bounded and FAILS OPEN: if PVFinder is down or cold-starting,
 --   the account keeps hopping on the hub / Roblox list alone.
 -- =====================================================================
-do
+-- ===== MULTI-SITE: one independent PVFinder sink per site (separate login token, state and timers) =====
+local function makeSink(BASE, SUFFIX)
+	local SINKTAB
+		local SINK = {}
 	local P = { session = "", lastRenew = 0, denyStreak = 0, downUntil = 0 }
-	P.PLACE = tonumber(game.PlaceId)
-
-	P.CATALOG = {}
-	for _, n in ipairs({
-		"gorilla king", "nightflame", "cosmic dragon", "cosmic skeleton boss", "gorillastein",
-		"abomination kong", "alien skeleton boss", "archangel", "cave dragon", "celestial sunlion",
-		"centaur", "eternal lunar dragon", "gargoyle", "godzilla", "jellyfish", "king kong",
-		"kitsune", "medusa", "mosasaurus", "oni tiger", "pegasus", "pure jellyfish", "razorfang",
-		"royal skywhale", "shark", "shelltide voyager", "skeleton horse", "stag", "starry fox",
-		"unicorn", "voidseer pumpkin", "werewolf", "world burner",
-	}) do P.CATALOG[n] = true end
-
-	P.AREAS = {
-		cherryblossom = "Cherry Blossom", lightdark = "Light Dark", angelsdemons = "Light Dark",
-		titantemple = "Titan Temple", enchantedforest = "Enchanted Forest",
-		alien = "Alien", alienbiome = "Alien", alienworld = "Alien", alienlagoon = "Alien Lagoon",
-	}
-
-	function P.resolveZone(areaId)
-		local key = (tostring(areaId or ""):lower():gsub("[^%w]", ""))
-		if P.AREAS[key] then return P.AREAS[key] end
-		if key:find("alien", 1, true) then return "Alien" end
-		return nil
-	end
-
-	function P.nameKey(name)
-		return (tostring(name or ""):match("^%s*(.-)%s*$"):lower())
-	end
-
-	function P.enabled()
-		return CONFIG.PVF_ENABLED ~= false
-			and type(CONFIG.PVF_BASE) == "string" and CONFIG.PVF_BASE ~= ""
-			and type(httpRequest) == "function"
-	end
-
-	-- same file name as bot-hop.lua used, so an existing node token is reused
-	function P.authFile()
-		local lp = Players.LocalPlayer
-		return "PVFinder_Hop_Auth_" .. tostring(lp and lp.UserId or 0) .. ".txt"
-	end
-
-	function P.call(method, path, data, auth)
-		local headers = { Accept = "application/json" }
-		local opt = { Url = CONFIG.PVF_BASE .. path, Method = method, Headers = headers, Timeout = 10 }
-		if data ~= nil then
-			local body = jsonEncode(data)
-			if not body then return 0, nil end
-			headers["Content-Type"] = "application/json"
-			opt.Body = body
+		P.PLACE = tonumber(game.PlaceId)
+	
+		P.CATALOG = {}
+		for _, n in ipairs({
+			"gorilla king", "nightflame", "cosmic dragon", "cosmic skeleton boss", "gorillastein",
+			"abomination kong", "alien skeleton boss", "archangel", "cave dragon", "celestial sunlion",
+			"centaur", "eternal lunar dragon", "gargoyle", "godzilla", "jellyfish", "king kong",
+			"kitsune", "medusa", "mosasaurus", "oni tiger", "pegasus", "pure jellyfish", "razorfang",
+			"royal skywhale", "shark", "shelltide voyager", "skeleton horse", "stag", "starry fox",
+			"unicorn", "voidseer pumpkin", "werewolf", "world burner",
+		}) do P.CATALOG[n] = true end
+	
+		P.AREAS = {
+			cherryblossom = "Cherry Blossom", lightdark = "Light Dark", angelsdemons = "Light Dark",
+			titantemple = "Titan Temple", enchantedforest = "Enchanted Forest",
+			alien = "Alien", alienbiome = "Alien", alienworld = "Alien", alienlagoon = "Alien Lagoon",
+		}
+	
+		function P.resolveZone(areaId)
+			local key = (tostring(areaId or ""):lower():gsub("[^%w]", ""))
+			if P.AREAS[key] then return P.AREAS[key] end
+			if key:find("alien", 1, true) then return "Alien" end
+			return nil
 		end
-		if auth and auth ~= "" then headers.Authorization = "Bearer " .. auth end
-		local ok, res = pcall(httpRequest, opt)
-		if not ok or type(res) ~= "table" then return 0, nil end
-		local code = tonumber(res.StatusCode or res.status or res.status_code) or 0
-		return code, jsonDecode(tostring(res.Body or res.body or "{}"))
-	end
-
-	function P.api(path, data) return P.call("POST", path, data, P.session) end
-
-	function P.loadSession()
-		if P.session ~= "" then return end
-		local g = genv()
-		local tok = g and g.PVF_HOP_TOKEN
-		if type(tok) ~= "string" or tok == "" then
-			local ok, v = pcall(readfile, P.authFile())
-			tok = (ok and type(v) == "string") and v:match("^%s*(.-)%s*$") or ""
+	
+		function P.nameKey(name)
+			return (tostring(name or ""):match("^%s*(.-)%s*$"):lower())
 		end
-		if type(tok) == "string" and tok:match("^pvfa_[%w_%-]+$") then P.session = tok end
-	end
-
-	function P.saveSession(tok)
-		P.session = tok
-		local g = genv()
-		if g then g.PVF_HOP_TOKEN = tok end
-		if type(writefile) == "function" then pcall(writefile, P.authFile(), tok) end
-	end
-
-	function P.enroll()
-		P.loadSession()
-		if P.session ~= "" then return true end
-		local code, res = P.call("POST", "/api/collector/register", { place_id = P.PLACE, server_id = game.JobId }, nil)
-		if code == 201 and res and res.ok and type(res.session_token) == "string" then
-			P.saveSession(res.session_token)
-			log("pvfinder: node registered")
-			return true
+	
+		function P.enabled()
+			return CONFIG.PVF_ENABLED ~= false
+				and type(BASE) == "string" and BASE ~= ""
+				and type(httpRequest) == "function"
 		end
-		log("pvfinder: register HTTP " .. tostring(code))
-		return false
-	end
-
-	-- enroll + keep the session alive (renewed at most every 10 minutes)
-	function P.ensure()
-		if not P.enroll() then return false end
-		if P.lastRenew == 0 or os.clock() - P.lastRenew > 600 then
-			local code, res = P.api("/api/collector/renew", {})
-			if code == 200 and res and res.ok then
-				P.lastRenew = os.clock()
-			elseif code == 401 then
-				P.saveSession("")
-				if not P.enroll() then return false end
-				P.lastRenew = os.clock()
+	
+		-- same file name as bot-hop.lua used, so an existing node token is reused
+		function P.authFile()
+			local lp = Players.LocalPlayer
+			return "PVFinder_Hop_Auth_" .. tostring(lp and lp.UserId or 0) .. SUFFIX .. ".txt"
+		end
+	
+		function P.call(method, path, data, auth)
+			local headers = { Accept = "application/json" }
+			local opt = { Url = BASE .. path, Method = method, Headers = headers, Timeout = 10 }
+			if data ~= nil then
+				local body = jsonEncode(data)
+				if not body then return 0, nil end
+				headers["Content-Type"] = "application/json"
+				opt.Body = body
 			end
+			if auth and auth ~= "" then headers.Authorization = "Bearer " .. auth end
+			local ok, res = pcall(httpRequest, opt)
+			if not ok or type(res) ~= "table" then return 0, nil end
+			local code = tonumber(res.StatusCode or res.status or res.status_code) or 0
+			return code, jsonDecode(tostring(res.Body or res.body or "{}"))
 		end
-		return true
-	end
-
-	-- true = scan this server, false = PVFinder already has it, nil = unreachable
-	function CONFIG.pvfStart()
-		if not P.enabled() then return nil end
-		if os.clock() < P.downUntil then return nil end
-		for attempt = 1, 2 do
-			if P.enroll() then
-				local code, res = P.api("/api/hop/start", { place_id = P.PLACE, server_id = game.JobId })
-				if code == 200 and res and res.ok then return res.scan == true end
-				if code == 401 then
+	
+		function P.api(path, data) return P.call("POST", path, data, P.session) end
+	
+		function P.loadSession()
+			if P.session ~= "" then return end
+			local g = genv()
+			local tok = g and g.PVF_HOP_TOKEN
+			if type(tok) ~= "string" or tok == "" then
+				local ok, v = pcall(readfile, P.authFile())
+				tok = (ok and type(v) == "string") and v:match("^%s*(.-)%s*$") or ""
+			end
+			if type(tok) == "string" and tok:match("^pvfa_[%w_%-]+$") then P.session = tok end
+		end
+	
+		function P.saveSession(tok)
+			P.session = tok
+			local g = genv()
+			if g then g.PVF_HOP_TOKEN = tok end
+			if type(writefile) == "function" then pcall(writefile, P.authFile(), tok) end
+		end
+	
+		function P.enroll()
+			P.loadSession()
+			if P.session ~= "" then return true end
+			local code, res = P.call("POST", "/api/collector/register", { place_id = P.PLACE, server_id = game.JobId }, nil)
+			if code == 201 and res and res.ok and type(res.session_token) == "string" then
+				P.saveSession(res.session_token)
+				log("pvfinder: node registered")
+				return true
+			end
+			log("pvfinder: register HTTP " .. tostring(code))
+			return false
+		end
+	
+		-- enroll + keep the session alive (renewed at most every 10 minutes)
+		function P.ensure()
+			if not P.enroll() then return false end
+			if P.lastRenew == 0 or os.clock() - P.lastRenew > 600 then
+				local code, res = P.api("/api/collector/renew", {})
+				if code == 200 and res and res.ok then
+					P.lastRenew = os.clock()
+				elseif code == 401 then
 					P.saveSession("")
-				else
-					log("pvfinder: start HTTP " .. tostring(code))
-					if code == 0 then break end
+					if not P.enroll() then return false end
+					P.lastRenew = os.clock()
 				end
 			end
-			task.wait(1)
+			return true
 		end
-		P.downUntil = os.clock() + 60
-		return nil
-	end
-
-	function P.readOk(eggState)
-		local ok, snap = pcall(eggState.ReadFieldEggs)
-		return ok and type(snap) == "table" and type(snap.Records) == "table"
-	end
-
-	function P.liveGlobalIds(eggState)
-		local ok, snap = pcall(eggState.ReadFieldEggs)
-		if not ok or type(snap) ~= "table" or type(snap.Records) ~= "table" then return nil end
-		local set = {}
-		for key, rec in pairs(snap.Records) do
-			if type(rec) == "table" and CONFIG.recIsLive(rec) then
-				set["G/" .. tostring(rec.Uid or key)] = true
-			end
-		end
-		return set
-	end
-
-	local function sane(v, lo)
-		if v == nil then return nil end
-		if v ~= v or v == math.huge or v >= 1e18 or v < lo then return nil end
-		return v
-	end
-
-	function P.buildItems(assets, eggState)
-		local items, ids, scopes = {}, {}, { "G" }
-		for _, hit in ipairs(scan(assets, eggState)) do
-			local rec = hit.record or {}
-			local zone = P.resolveZone(rec.AreaId)
-			local rar = tostring(hit.rarity or ""):lower()
-			local include
-			if CONFIG.PVF_TOP_ONLY ~= false then
-				include = (rar == "secret" or rar == "eternal" or rar == "divine")
-			elseif zone == "Alien" then
-				include = (rar == "secret" or rar == "eternal" or rar == "divine")
-			else
-				include = P.CATALOG[P.nameKey(hit.name)] == true
-			end
-			if not include and CONFIG.PVF_TOP_ONLY == false and CONFIG.PVF_INCLUDE_TARGET_RARITIES == true and hit.rare then include = true end
-			local uid = tostring(rec.Uid or "")
-			if zone and include and uid ~= "" then
-				local mut = mutationText(hit)
-				local id = "G/" .. uid
-				local cash = sane(tonumber(hit.earn), 0)
-				items[#items + 1] = {
-					place_id = P.PLACE, server_id = game.JobId,
-					egg_id = id, egg_name = tostring(hit.name), rarity = tostring(hit.rarity), biome = zone,
-					income_per_second = cash,
-					income_type = cash and "ESTIMADO" or "DESCONOCIDO",
-					weight_kg = sane(tonumber(hit.weight), 0),
-					multiplier = sane(tonumber(rec.AssetScale), 1e-12),
-					mutation = (mut ~= "NONE" and mut ~= "") and mut or nil,
-				}
-				ids[#ids + 1] = id
-			end
-		end
-
-		-- Halloween Dimension world eggs (catalog names only, like bot-hop.lua did)
-		local dim = workspace:FindFirstChild("HalloweenDimension")
-		if dim and dim:FindFirstChild("WorldEggs") then
-			scopes[#scopes + 1] = "H"
-			local okH, hh = pcall(halloweenScan)
-			if okH and type(hh) == "table" then
-				for _, hit in ipairs(hh) do
-					local hrar = tostring(hit.rarity or ""):lower()
-					local want
-					if CONFIG.PVF_TOP_ONLY ~= false then
-						want = (hrar == "secret" or hrar == "eternal" or hrar == "divine")
+	
+		-- true = scan this server, false = PVFinder already has it, nil = unreachable
+		function SINK.pvfStart()
+			if not P.enabled() then return nil end
+			if os.clock() < P.downUntil then return nil end
+			for attempt = 1, 2 do
+				if P.enroll() then
+					local code, res = P.api("/api/hop/start", { place_id = P.PLACE, server_id = game.JobId })
+					if code == 200 and res and res.ok then return res.scan == true end
+					if code == 401 then
+						P.saveSession("")
 					else
-						want = P.CATALOG[P.nameKey(hit.name)] == true
+						log("pvfinder: start HTTP " .. tostring(code))
+						if code == 0 then break end
 					end
-					if want and hit.uid then
-						local cash = sane(tonumber(hit.earn), 1e-12)
-						items[#items + 1] = {
-							place_id = P.PLACE, server_id = game.JobId,
-							egg_id = "H/" .. tostring(hit.uid),
-							egg_name = tostring(hit.name), rarity = tostring(hit.rarity),
-							biome = "Halloween Z" .. tostring(hit.zone or "?"),
-							income_per_second = cash,
-							income_type = cash and "ESTIMADO" or "DESCONOCIDO",
-						}
+				end
+				task.wait(1)
+			end
+			P.downUntil = os.clock() + 60
+			return nil
+		end
+	
+		function P.readOk(eggState)
+			local ok, snap = pcall(eggState.ReadFieldEggs)
+			return ok and type(snap) == "table" and type(snap.Records) == "table"
+		end
+	
+		function P.liveGlobalIds(eggState)
+			local ok, snap = pcall(eggState.ReadFieldEggs)
+			if not ok or type(snap) ~= "table" or type(snap.Records) ~= "table" then return nil end
+			local set = {}
+			for key, rec in pairs(snap.Records) do
+				if type(rec) == "table" and CONFIG.recIsLive(rec) then
+					set["G/" .. tostring(rec.Uid or key)] = true
+				end
+			end
+			return set
+		end
+	
+		local function sane(v, lo)
+			if v == nil then return nil end
+			if v ~= v or v == math.huge or v >= 1e18 or v < lo then return nil end
+			return v
+		end
+	
+		function P.buildItems(assets, eggState)
+			local items, ids, scopes = {}, {}, { "G" }
+			for _, hit in ipairs(scan(assets, eggState)) do
+				local rec = hit.record or {}
+				local zone = P.resolveZone(rec.AreaId)
+				local rar = tostring(hit.rarity or ""):lower()
+				local include
+				if CONFIG.PVF_TOP_ONLY ~= false then
+					include = (rar == "cosmic" or rar == "secret" or rar == "eternal" or rar == "divine")
+				elseif zone == "Alien" then
+					include = (rar == "secret" or rar == "eternal" or rar == "divine")
+				else
+					include = P.CATALOG[P.nameKey(hit.name)] == true
+				end
+				if not include and CONFIG.PVF_TOP_ONLY == false and CONFIG.PVF_INCLUDE_TARGET_RARITIES == true and hit.rare then include = true end
+				local uid = tostring(rec.Uid or "")
+				if zone and include and uid ~= "" then
+					local mut = mutationText(hit)
+					local id = "G/" .. uid
+					local cash = sane(tonumber(hit.earn), 0)
+					items[#items + 1] = {
+						place_id = P.PLACE, server_id = game.JobId,
+						egg_id = id, egg_name = tostring(hit.name), rarity = tostring(hit.rarity), biome = zone,
+						income_per_second = cash,
+						income_type = cash and "ESTIMADO" or "DESCONOCIDO",
+						weight_kg = sane(tonumber(hit.weight), 0),
+						multiplier = sane(tonumber(rec.AssetScale), 1e-12),
+						mutation = (mut ~= "NONE" and mut ~= "") and mut or nil,
+					}
+					ids[#ids + 1] = id
+				end
+			end
+	
+			-- Halloween Dimension world eggs (catalog names only, like bot-hop.lua did)
+			local dim = workspace:FindFirstChild("HalloweenDimension")
+			if dim and dim:FindFirstChild("WorldEggs") then
+				scopes[#scopes + 1] = "H"
+				local okH, hh = pcall(halloweenScan)
+				if okH and type(hh) == "table" then
+					for _, hit in ipairs(hh) do
+						local hrar = tostring(hit.rarity or ""):lower()
+						local want
+						if CONFIG.PVF_TOP_ONLY ~= false then
+							want = (hrar == "cosmic" or hrar == "secret" or hrar == "eternal" or hrar == "divine")
+						else
+							want = P.CATALOG[P.nameKey(hit.name)] == true
+						end
+						if want and hit.uid then
+							local cash = sane(tonumber(hit.earn), 1e-12)
+							items[#items + 1] = {
+								place_id = P.PLACE, server_id = game.JobId,
+								egg_id = "H/" .. tostring(hit.uid),
+								egg_name = tostring(hit.name), rarity = tostring(hit.rarity),
+								biome = "Halloween Z" .. tostring(hit.zone or "?"),
+								income_per_second = cash,
+								income_type = cash and "ESTIMADO" or "DESCONOCIDO",
+							}
+						end
 					end
 				end
 			end
+			return items, ids, scopes
 		end
-		return items, ids, scopes
-	end
-
-	-- a vanished egg is only reported after it is missing on TWO reads (4s, then 1.5s later);
-	-- a source that cannot be read never counts as "missing"
-	function P.recheck(eggState, ids, snapshotAt)
-		if type(snapshotAt) ~= "number" then return end
-		local candidates = {}
-		for _, id in ipairs(ids) do candidates[#candidates + 1] = id end
-		if #candidates == 0 then return end
-		for _, delay in ipairs({ 4, 1.5 }) do
-			task.wait(delay)
-			local set = P.liveGlobalIds(eggState)
-			if not set then return end
-			local missing = {}
-			for _, id in ipairs(candidates) do
-				if not set[id] then missing[#missing + 1] = id end
+	
+		-- a vanished egg is only reported after it is missing on TWO reads (4s, then 1.5s later);
+		-- a source that cannot be read never counts as "missing"
+		function P.recheck(eggState, ids, snapshotAt)
+			if type(snapshotAt) ~= "number" then return end
+			local candidates = {}
+			for _, id in ipairs(ids) do candidates[#candidates + 1] = id end
+			if #candidates == 0 then return end
+			for _, delay in ipairs({ 4, 1.5 }) do
+				task.wait(delay)
+				local set = P.liveGlobalIds(eggState)
+				if not set then return end
+				local missing = {}
+				for _, id in ipairs(candidates) do
+					if not set[id] then missing[#missing + 1] = id end
+				end
+				if #missing == 0 then return end
+				candidates = missing
 			end
-			if #missing == 0 then return end
-			candidates = missing
-		end
-		local code, res = P.api("/api/hop/recheck", {
-			place_id = P.PLACE, server_id = game.JobId, snapshot_at = snapshotAt, missing_ids = candidates,
-		})
-		if code == 200 and res and (tonumber(res.marked_absent) or 0) > 0 then
-			log("pvfinder: " .. tostring(res.marked_absent) .. " egg(s) confirmed taken")
-		end
-	end
-
-	function P.report(assets, eggState)
-		local scanFlag = CONFIG.pvfStart()
-		if scanFlag ~= true then
-			if scanFlag == false then log("pvfinder: server already covered - skipping snapshot") end
-			return
-		end
-		-- never send (or mark the server visited) off a failed read
-		if not P.readOk(eggState) then log("pvfinder: egg sources unreadable - not sending") return end
-		local settle = tonumber(CONFIG.PVF_SETTLE) or 0
-		if settle > 0 then task.wait(settle) end   -- optional replication settle (0 = off in fast mode)
-		if not P.readOk(eggState) then return end
-
-		local items, ids, scopes = P.buildItems(assets, eggState)
-		if #items > 500 then log("pvfinder: more than 500 detections - not sending a truncated list") return end
-		log(("pvfinder: snapshot %d egg(s)"):format(#items))
-
-		local payload = { place_id = P.PLACE, server_id = game.JobId, items = items, scopes = scopes }
-		local snapshotAt
-		for attempt = 1, 3 do
-			local code, res = P.api("/api/hop/snapshot", payload)
-			if code == 200 and res and res.ok then
-				snapshotAt = res.snapshot_at
-				log("pvfinder: snapshot accepted")
-				break
-			elseif code == 409 then
-				log("pvfinder: JobId already reported")
-				return
-			elseif code == 401 then
-				P.saveSession("")
-				if CONFIG.pvfStart() ~= true then return end
-			elseif code == 400 or code == 403 then
-				log("pvfinder: snapshot rejected (" .. tostring(code) .. ")")
-				return
-			else
-				log("pvfinder: snapshot HTTP " .. tostring(code) .. " attempt " .. attempt .. "/3")
-				if code == 0 then P.downUntil = os.clock() + 60 return end
-				task.wait(attempt * 2)
+			local code, res = P.api("/api/hop/recheck", {
+				place_id = P.PLACE, server_id = game.JobId, snapshot_at = snapshotAt, missing_ids = candidates,
+			})
+			if code == 200 and res and (tonumber(res.marked_absent) or 0) > 0 then
+				log("pvfinder: " .. tostring(res.marked_absent) .. " egg(s) confirmed taken")
 			end
 		end
-		if snapshotAt and #ids > 0 and CONFIG.PVF_RECHECK ~= false then
-			P.recheck(eggState, ids, snapshotAt)
+	
+		function P.report(assets, eggState)
+			local scanFlag = SINK.pvfStart()
+			if scanFlag ~= true then
+				if scanFlag == false then log("pvfinder: server already covered - skipping snapshot") end
+				return
+			end
+			-- never send (or mark the server visited) off a failed read
+			if not P.readOk(eggState) then log("pvfinder: egg sources unreadable - not sending") return end
+			local settle = tonumber(CONFIG.PVF_SETTLE) or 0
+			if settle > 0 then task.wait(settle) end   -- optional replication settle (0 = off in fast mode)
+			if not P.readOk(eggState) then return end
+	
+			local items, ids, scopes = P.buildItems(assets, eggState)
+			if #items > 500 then log("pvfinder: more than 500 detections - not sending a truncated list") return end
+			log(("pvfinder: snapshot %d egg(s)"):format(#items))
+	
+			local payload = { place_id = P.PLACE, server_id = game.JobId, items = items, scopes = scopes }
+			local snapshotAt
+			for attempt = 1, 3 do
+				local code, res = P.api("/api/hop/snapshot", payload)
+				if code == 200 and res and res.ok then
+					snapshotAt = res.snapshot_at
+					log("pvfinder: snapshot accepted")
+					break
+				elseif code == 409 then
+					log("pvfinder: JobId already reported")
+					return
+				elseif code == 401 then
+					P.saveSession("")
+					if SINK.pvfStart() ~= true then return end
+				elseif code == 400 or code == 403 then
+					log("pvfinder: snapshot rejected (" .. tostring(code) .. ")")
+					return
+				else
+					log("pvfinder: snapshot HTTP " .. tostring(code) .. " attempt " .. attempt .. "/3")
+					if code == 0 then P.downUntil = os.clock() + 60 return end
+					task.wait(attempt * 2)
+				end
+			end
+			if snapshotAt and #ids > 0 and CONFIG.PVF_RECHECK ~= false then
+				P.recheck(eggState, ids, snapshotAt)
+			end
 		end
-	end
+	
+		-- runs the report in its own thread; the caller waits at most PVF_MAX_WAIT seconds
+		function SINK.pvfReport(assets, eggState)
+			if not P.enabled() then return end
+			local done = false
+			task.spawn(function()
+				local ok, err = pcall(P.report, assets, eggState)
+				if not ok then log("pvfinder: report error: " .. tostring(err)) end
+				done = true
+			end)
+			local t0 = os.clock()
+			while not done and os.clock() - t0 < (tonumber(CONFIG.PVF_MAX_WAIT) or 14) do task.wait(0.1) end
+			if not done then log("pvfinder: still sending - moving on") end
+		end
+	
+		-- claim ONE server through PVFinder's coordinator (true = go ahead). Fails open.
+		function SINK.pvfClaim(id, cand)
+			if not P.enabled() then return true end
+			if os.clock() < P.downUntil then return true end
+			if not P.ensure() then return true end
+			local code, res = P.api("/api/hop/next", {
+				place_id = P.PLACE, current_server = game.JobId,
+				candidates = { {
+					id = id,
+					playing = cand and tonumber(cand.playing) or 0,
+					maxPlayers = cand and tonumber(cand.maxPlayers) or CONFIG.SERVER_CAPACITY,
+				} },
+			})
+			if code ~= 200 or type(res) ~= "table" then
+				if code == 0 then P.downUntil = os.clock() + 60 end
+				return true
+			end
+			if res.server_id == id then
+				P.denyStreak = 0
+				return true
+			end
+			P.denyStreak = P.denyStreak + 1
+			-- if PVFinder refuses everything, something is off on its side: stop obeying it
+			if P.denyStreak >= 20 then return true end
+			return false
+		end
+	
+		-- give a reserved server back when the join failed
+		function SINK.pvfRelease(id)
+			if not P.enabled() or P.session == "" then return end
+			task.spawn(function()
+				pcall(P.api, "/api/hop/release", { place_id = P.PLACE, server_id = id, failed = true })
+			end)
+		end
+	return SINK
+end
 
-	-- runs the report in its own thread; the caller waits at most PVF_MAX_WAIT seconds
+do
+	local sinks = {}
+	local bases = {}
+	if type(CONFIG.PVF_BASE) == "string" and CONFIG.PVF_BASE ~= "" then bases[#bases + 1] = CONFIG.PVF_BASE end
+	if type(CONFIG.PVF_BASE_2) == "string" and CONFIG.PVF_BASE_2 ~= "" and CONFIG.PVF_BASE_2 ~= CONFIG.PVF_BASE then bases[#bases + 1] = CONFIG.PVF_BASE_2 end
+	for i, b in ipairs(bases) do sinks[#sinks + 1] = makeSink(b, i == 1 and "" or ("_" .. tostring(i))) end
+	if #sinks == 0 then sinks[1] = makeSink("", "") end
+	-- claim / release stay on the first site only (RELAY_ONLY normally skips them anyway)
+	CONFIG.pvfStart   = sinks[1].pvfStart
+	CONFIG.pvfClaim   = sinks[1].pvfClaim
+	CONFIG.pvfRelease = sinks[1].pvfRelease
+	-- every site gets the same snapshot, in parallel; the caller still waits at most PVF_MAX_WAIT
 	function CONFIG.pvfReport(assets, eggState)
-		if not P.enabled() then return end
-		local done = false
-		task.spawn(function()
-			local ok, err = pcall(P.report, assets, eggState)
-			if not ok then log("pvfinder: report error: " .. tostring(err)) end
-			done = true
-		end)
+		local pending = 0
+		for _, sk in ipairs(sinks) do
+			pending = pending + 1
+			task.spawn(function()
+				pcall(sk.pvfReport, assets, eggState)
+				pending = pending - 1
+			end)
+		end
 		local t0 = os.clock()
-		while not done and os.clock() - t0 < (tonumber(CONFIG.PVF_MAX_WAIT) or 14) do task.wait(0.1) end
-		if not done then log("pvfinder: still sending - moving on") end
-	end
-
-	-- claim ONE server through PVFinder's coordinator (true = go ahead). Fails open.
-	function CONFIG.pvfClaim(id, cand)
-		if not P.enabled() then return true end
-		if os.clock() < P.downUntil then return true end
-		if not P.ensure() then return true end
-		local code, res = P.api("/api/hop/next", {
-			place_id = P.PLACE, current_server = game.JobId,
-			candidates = { {
-				id = id,
-				playing = cand and tonumber(cand.playing) or 0,
-				maxPlayers = cand and tonumber(cand.maxPlayers) or CONFIG.SERVER_CAPACITY,
-			} },
-		})
-		if code ~= 200 or type(res) ~= "table" then
-			if code == 0 then P.downUntil = os.clock() + 60 end
-			return true
-		end
-		if res.server_id == id then
-			P.denyStreak = 0
-			return true
-		end
-		P.denyStreak = P.denyStreak + 1
-		-- if PVFinder refuses everything, something is off on its side: stop obeying it
-		if P.denyStreak >= 20 then return true end
-		return false
-	end
-
-	-- give a reserved server back when the join failed
-	function CONFIG.pvfRelease(id)
-		if not P.enabled() or P.session == "" then return end
-		task.spawn(function()
-			pcall(P.api, "/api/hop/release", { place_id = P.PLACE, server_id = id, failed = true })
-		end)
+		while pending > 0 and os.clock() - t0 < ((tonumber(CONFIG.PVF_MAX_WAIT) or 14) + 1) do task.wait(0.1) end
 	end
 end
 
