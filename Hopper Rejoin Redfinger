@@ -298,11 +298,22 @@ CONFIG.LAGGY_PENALTY               = 20     -- listed-ping over LIST_PING_SKIP: 
 CONFIG.ONLY_LIVE_STATES            = true   -- count only eggs in the Slot / Dropped state
 CONFIG.PVF_ENABLED                 = true   -- false = never talk to PVFinder
 CONFIG.PVF_BASE                    = "https://pvfinder.onrender.com"
-CONFIG.PVF_RECHECK                 = true   -- confirm vanished eggs (~5.5s extra on servers with eggs)
+CONFIG.PVF_RECHECK                 = false   -- confirm vanished eggs (~5.5s extra on servers with eggs)
 CONFIG.PVF_INCLUDE_TARGET_RARITIES = false  -- also send every Secret/Eternal/Divine egg to PVFinder
-CONFIG.PVF_MAX_WAIT                = 14     -- never let PVFinder stall a hop longer than this
+CONFIG.PVF_MAX_WAIT                = 2     -- never let PVFinder stall a hop longer than this
 CONFIG.PVF_TOP_ONLY                = true   -- PVFinder only receives Secret / Eternal / Divine eggs (everything else goes to your relay only)
 CONFIG.RELAY_ONLY                  = true   -- true = join ONLY servers your relay says are free (PVFinder is not asked)
+
+-- ===================== FAST MODE (default): land -> read eggs -> send -> hop =====================
+-- Every holding delay is removed. The floor is now Roblox's own join time (mobile: several seconds).
+-- Set any of these back through EGG_CONFIG if Roblox starts throwing flood / 429 errors.
+CONFIG.WAVE_HOLD         = false   -- true = pause hopping 4:30-5:05 of every 5-minute cycle
+CONFIG.MIN_HOP_GAP       = 2       -- seconds between two hops (was 10)
+CONFIG.DWELL             = 0       -- no wait after posting an egg (was 1.0)
+CONFIG.POLL              = 1       -- seconds between rescans if it ever stays (was 2)
+CONFIG.EGG_EMPTY_TIMEOUT = 3       -- max wait for egg data that reads empty (was 8)
+CONFIG.LIST_PAGES        = 2       -- pages of 100 servers per hop (each page is one request)
+CONFIG.PVF_SETTLE        = 0       -- no extra wait before the PVFinder snapshot
 CONFIG.DISCORD_WEBHOOK             = "https://discord.com/api/webhooks/1553898268226887855/fG9vg0e9vhb_dUCi0xWqNzYr5-2w8QwelJ282YrUZWI7KPrjdH3V8gqmG7JX7zqSPHEP"     -- one webhook fills every empty Discord route
 do
 	local okG, gEnv = pcall(getgenv)
@@ -2662,6 +2673,7 @@ local SPAWN_SETTLE = 5
 local SPAWN_HOLD_AT = 270 -- 4:30 into the cycle: stop hopping, hold for wave (use 240 for the last 60s)
 
 local function hoppingPaused()
+	if CONFIG.WAVE_HOLD == false then return false end   -- fast mode: never hold, always keep hopping
 	local e = os.time() % SPAWN_PERIOD
 	return e >= SPAWN_HOLD_AT or e < SPAWN_SETTLE
 end
@@ -4182,7 +4194,8 @@ do
 		end
 		-- never send (or mark the server visited) off a failed read
 		if not P.readOk(eggState) then log("pvfinder: egg sources unreadable - not sending") return end
-		task.wait(0.4)   -- let replication settle, then read the second time and use that one
+		local settle = tonumber(CONFIG.PVF_SETTLE) or 0
+		if settle > 0 then task.wait(settle) end   -- optional replication settle (0 = off in fast mode)
 		if not P.readOk(eggState) then return end
 
 		local items, ids, scopes = P.buildItems(assets, eggState)
