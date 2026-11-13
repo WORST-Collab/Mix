@@ -298,11 +298,11 @@ CONFIG.LAGGY_PENALTY               = 20     -- listed-ping over LIST_PING_SKIP: 
 CONFIG.ONLY_LIVE_STATES            = true   -- count only eggs in the Slot / Dropped state
 CONFIG.PVF_ENABLED                 = true   -- false = never talk to PVFinder
 CONFIG.PVF_BASE                    = "https://remake-pv.onrender.com"
-CONFIG.PVF_BASE_2                  = ""   -- second PVFinder site: OFF (only the remake site gets data)
+CONFIG.PVF_BASE_2                  = ""   -- second PVFinder site (old pvfinder.onrender.com); "" = off
 CONFIG.PVF_RECHECK                 = false   -- confirm vanished eggs (~5.5s extra on servers with eggs)
 CONFIG.PVF_INCLUDE_TARGET_RARITIES = false  -- also send every Secret/Eternal/Divine egg to PVFinder
 CONFIG.PVF_MAX_WAIT                = 2     -- never let PVFinder stall a hop longer than this
-CONFIG.PVF_TOP_ONLY                = true   -- PVFinder only receives Secret / Eternal / Divine eggs (everything else goes to your relay only)
+CONFIG.PVF_TOP_ONLY                = true   -- (no longer used: eggs reach PVFinder only through the relay, see the PV section on worst.homes)
 CONFIG.RELAY_ONLY                  = true   -- true = join ONLY servers your relay says are free (PVFinder is not asked)
 
 -- ===================== FAST MODE (default): land -> read eggs -> send -> hop =====================
@@ -1954,24 +1954,42 @@ function CONFIG.publishToHub(a)
 		or key == "" or key:find("PUT_FINDER", 1, true) then
 		return
 	end
+	CONFIG.hubPending = (CONFIG.hubPending or 0) + 1   -- the PVFinder status waits until this is back to 0
 	task.spawn(function()
-		a.sent = DateTime.now().UnixTimestampMillis
-		local body = jsonEncode(a)
-		if not body then return end
-		for attempt = 1, 3 do
-			local ok, res = pcall(httpRequest, {
-				Url     = url,
-				Method  = "POST",
-				Headers = { ["Content-Type"] = "application/json", ["x-key"] = key },
-				Body    = body,
-			})
-			local code = ok and type(res) == "table" and (res.StatusCode or res.status) or nil
-			if code and code >= 200 and code < 300 then return end
-			log("hub send failed (" .. tostring(code or res) .. ") attempt " .. attempt .. "/3")
-			if code and code >= 400 and code < 500 and code ~= 429 then return end
-			task.wait(attempt * 1.5)
-		end
+		pcall(function()
+			a.sent = DateTime.now().UnixTimestampMillis
+			local body = jsonEncode(a)
+			if not body then return end
+			for attempt = 1, 3 do
+				local ok, res = pcall(httpRequest, {
+					Url     = url,
+					Method  = "POST",
+					Headers = { ["Content-Type"] = "application/json", ["x-key"] = key },
+					Body    = body,
+				})
+				local code = ok and type(res) == "table" and (res.StatusCode or res.status) or nil
+				if code and code >= 200 and code < 300 then return end
+				log("hub send failed (" .. tostring(code or res) .. ") attempt " .. attempt .. "/3")
+				if code and code >= 400 and code < 500 and code ~= 429 then return end
+				task.wait(attempt * 1.5)
+			end
+		end)
+		CONFIG.hubPending = math.max(0, (CONFIG.hubPending or 1) - 1)
 	end)
+end
+
+-- PVFinder's name for the area an egg is in (same table as the PVFinder sink below). nil = unknown area:
+-- the relay does not send those to PV, exactly like before.
+local PV_AREAS = {
+	cherryblossom = "Cherry Blossom", lightdark = "Light Dark", angelsdemons = "Light Dark",
+	titantemple = "Titan Temple", enchantedforest = "Enchanted Forest",
+	alien = "Alien", alienbiome = "Alien", alienworld = "Alien", alienlagoon = "Alien Lagoon",
+}
+local function pvZoneOf(areaId)
+	local key = (tostring(areaId or ""):lower():gsub("[^%w]", ""))
+	if PV_AREAS[key] then return PV_AREAS[key] end
+	if key:find("alien", 1, true) then return "Alien" end
+	return nil
 end
 
 local function relayPayload(hit, players, hubOnly)
@@ -2028,6 +2046,11 @@ local function relayPayload(hit, players, hubOnly)
 		mutation = (mut ~= "NONE") and mut or "",
 		players  = tostring(players) .. "/" .. tostring(Players.MaxPlayers),
 		bot      = ACCT_TAG,   -- which account found it: the relay routes alerts to client keys by this
+		-- PVFinder details: the relay forwards eggs to PV (bots never send eggs to PV themselves)
+		pv_id     = hit.halloween and ("H/" .. tostring(hit.uid or "")) or ("G/" .. tostring(hit.record and hit.record.Uid or "")),
+		pv_biome  = hit.halloween and ("Halloween Z" .. tostring(hit.zone or "?")) or pvZoneOf(hit.record and hit.record.AreaId),
+		pv_weight = (not hit.halloween) and tonumber(hit.weight) or nil,
+		pv_scale  = (not hit.halloween) and hit.record and tonumber(hit.record.AssetScale) or nil,
 	})
 
 	if hubOnly then return nil end   -- non-rare egg: joiner hub only, no Discord message
@@ -3679,16 +3702,13 @@ local function main()
 	-- Report anything already sitting here first, and wait for the post to
 	-- actually go through (webhook cooldown included), so the ping hop below
 	-- never skips eggs on this server.
-	-- PVFinder upload starts FIRST, in the background, so a slow/failed Discord
-	-- post (30s cooldown retries) can never delay it past the egg being stolen.
-	local pvDone = false
-	task.spawn(function()
-		if CONFIG.pvfReport then pcall(CONFIG.pvfReport, assets, eggState) end
-		pvDone = true
-	end)
 	flushEggs(assets, eggState)
+	-- PVFinder goes LAST: only after the eggs reached the relay (the Joiner and worst.homes).
+	-- It no longer carries eggs (the relay forwards those); it only tells PVFinder this bot is
+	-- alive and scanned this server. Capped at PVF_MAX_WAIT, so it barely touches the hop.
 	local pvT0 = os.clock()
-	while not pvDone and os.clock() - pvT0 < 6 do task.wait(0.1) end
+	while (CONFIG.hubPending or 0) > 0 and os.clock() - pvT0 < 4 do task.wait(0.05) end
+	if CONFIG.pvfReport then pcall(CONFIG.pvfReport, assets, eggState) end
 
 	-- Halloween Dimension: purely additive reporting. Its eggs are (almost)
 	-- always up, so the result is ignored and never gates a hop - and nothing
@@ -4304,9 +4324,13 @@ local function makeSink(BASE, SUFFIX)
 			if settle > 0 then task.wait(settle) end   -- optional replication settle (0 = off in fast mode)
 			if not P.readOk(eggState) then return end
 	
-			local items, ids, scopes = P.buildItems(assets, eggState)
-			if #items > 500 then log("pvfinder: more than 500 detections - not sending a truncated list") return end
-			log(("pvfinder: snapshot %d egg(s)"):format(#items))
+			-- Eggs reach PVFinder ONLY through the relay now (the PV sliders on worst.homes decide which).
+			-- This snapshot carries no eggs: it tells PVFinder this bot is alive (its bot list) and that
+			-- this server was scanned (its "servers scanned" count), empty servers included.
+			local items, ids, scopes = {}, {}, { "G" }
+			local hdim = workspace:FindFirstChild("HalloweenDimension")
+			if hdim and hdim:FindFirstChild("WorldEggs") then scopes[#scopes + 1] = "H" end
+			log("pvfinder: status (server scanned)")
 	
 			local payload = { place_id = P.PLACE, server_id = game.JobId, items = items, scopes = scopes }
 			local snapshotAt
@@ -4314,7 +4338,7 @@ local function makeSink(BASE, SUFFIX)
 				local code, res = P.api("/api/hop/snapshot", payload)
 				if code == 200 and res and res.ok then
 					snapshotAt = res.snapshot_at
-					log("pvfinder: snapshot accepted")
+					log("pvfinder: status accepted")
 					break
 				elseif code == 409 then
 					log("pvfinder: JobId already reported")
