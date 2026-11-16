@@ -909,7 +909,7 @@ end
 
 -- The server we just teleported out of (rolling, one entry): the self-bounce
 -- guard that stops us aiming straight back at the instance we just left.
-local LEFT_LOG = "egg-grabber-delta-left.txt"
+local LEFT_LOG = ("egg-grabber-delta-left-%s.txt"):format(ACCT_TAG)
 
 local function writeLeft(jobId)
 	safeWrite(LEFT_LOG, jobId)
@@ -926,7 +926,7 @@ end
 -- Wall-clock stamp of the last join attempt. On disk on purpose: getgenv does
 -- not survive a teleport, and the whole point is to measure the gap ACROSS one
 -- (a landing we reject can re-hop seconds after arriving).
-local JOIN_LOG = "egg-grabber-delta-lastjoin.txt"
+local JOIN_LOG = ("egg-grabber-delta-lastjoin-%s.txt"):format(ACCT_TAG)
 
 local function stampJoin()
 	safeWrite(JOIN_LOG, tostring(os.time()))
@@ -3695,6 +3695,7 @@ local function main()
 		log("nowhere to go - staying here after all")
 	end
 
+	if CONFIG.pvfReport then task.spawn(pcall, CONFIG.pvfReport, assets, eggState) end
 	if not waitForEggs(eggState, CONFIG.LOAD_TIMEOUT) then
 		log("egg data did not populate in time - scanning anyway")
 	end
@@ -3708,7 +3709,6 @@ local function main()
 	-- alive and scanned this server. Capped at PVF_MAX_WAIT, so it barely touches the hop.
 	local pvT0 = os.clock()
 	while (CONFIG.hubPending or 0) > 0 and os.clock() - pvT0 < 4 do task.wait(0.05) end
-	if CONFIG.pvfReport then pcall(CONFIG.pvfReport, assets, eggState) end
 
 	-- Halloween Dimension: purely additive reporting. Its eggs are (almost)
 	-- always up, so the result is ignored and never gates a hop - and nothing
