@@ -296,7 +296,7 @@ CONFIG.LIST_MIN_PLAYING            = 0      -- listed player range we are willin
 CONFIG.LIST_MAX_PLAYING            = 5
 CONFIG.LAGGY_PENALTY               = 20     -- listed-ping over LIST_PING_SKIP: ranked lower, not skipped
 CONFIG.ONLY_LIVE_STATES            = true   -- count only eggs in the Slot / Dropped state
-CONFIG.PVF_ENABLED                 = false  -- TEST: PVFinder off for now (true = talk to PVFinder again)
+CONFIG.PVF_ENABLED                 = false  -- PVFinder off (true = talk to PVFinder again)
 CONFIG.PVF_BASE                    = "https://remake-pv.onrender.com"
 CONFIG.PVF_BASE_2                  = ""   -- second PVFinder site (old pvfinder.onrender.com); "" = off
 CONFIG.PVF_RECHECK                 = false   -- confirm vanished eggs (~5.5s extra on servers with eggs)
@@ -315,8 +315,6 @@ CONFIG.POLL              = 1       -- seconds between rescans if it ever stays (
 CONFIG.EGG_EMPTY_TIMEOUT = 3       -- max wait for egg data that reads empty (was 8)
 CONFIG.LIST_PAGES        = 2       -- pages of 100 servers per hop (each page is one request)
 CONFIG.PVF_SETTLE        = 0       -- no extra wait before the PVFinder snapshot
-CONFIG.HOP_ONLY_ON_RARE  = true    -- TEST: stay in a server until a Secret/Eternal/Divine egg is there, post it, then hop (false = hop all the time)
-CONFIG.COUNT_WEBHOOK     = "https://discord.com/api/webhooks/1566319766321500300/RWVSwUufEmGxSJG0aANvp91CQgmllPiXKtpmWVHZoTRDnyqvcSneUUc4AWaL3bQgbDFY"   -- TEST: one numbered message per server scanned ("" = off)
 CONFIG.DISCORD_WEBHOOK             = "https://discord.com/api/webhooks/1553898268226887855/fG9vg0e9vhb_dUCi0xWqNzYr5-2w8QwelJ282YrUZWI7KPrjdH3V8gqmG7JX7zqSPHEP"     -- one webhook fills every empty Discord route
 do
 	local okG, gEnv = pcall(getgenv)
@@ -3167,7 +3165,7 @@ local lastIdleLog = 0
 local function idleLog()
 	if os.clock() - lastIdleLog >= 30 then
 		lastIdleLog = os.clock()
-		log("no Secret/Eternal/Divine egg here - staying put until one spawns")
+		log("no rare egg out - staying put (idle until one spawns)")
 	end
 end
 
@@ -3637,36 +3635,6 @@ local function renderOffEnable()
 	return true
 end
 
--- TEST: numbered "server scanned" message on COUNT_WEBHOOK (stands in for the PVFinder status for now).
--- Runs in the background with ONE try and no retry, so it can never slow a hop down.
-function CONFIG.hasRare(hits)
-	for _, h in ipairs(hits or {}) do
-		if h.rare then return true end
-	end
-	return false
-end
-
-function CONFIG.sendCount(hits, players)
-	local url = CONFIG.COUNT_WEBHOOK
-	if type(url) ~= "string" or url == "" or type(httpRequest) ~= "function" then return end
-	local file = ("egg-grabber-delta-count-%s.txt"):format(tostring(ACCT_TAG))
-	local n = (tonumber((safeRead(file) or ""):match("%d+")) or 0) + 1
-	safeWrite(file, tostring(n))
-	local rare = {}
-	for _, h in ipairs(hits or {}) do
-		if h.rare then rare[#rare + 1] = tostring(h.rarity) .. " " .. tostring(h.name) end
-	end
-	local body = jsonEncode({
-		content = ("**#%d** `%s` scanned `%s` (%d/%d) - %s"):format(n, tostring(ACCT_TAG), tostring(game.JobId),
-			tonumber(players) or 0, CONFIG.SERVER_CAPACITY, #rare > 0 and table.concat(rare, ", ") or "no rare eggs"),
-		allowed_mentions = { parse = {} },
-	})
-	if not body then return end
-	task.spawn(function()
-		pcall(httpRequest, { Url = url, Method = "POST", Headers = { ["Content-Type"] = "application/json" }, Body = body })
-	end)
-end
-
 local function main()
 	-- Kill the 3D view before anything else: every wait below is replication
 	-- (game:IsLoaded, WaitForChild, ReadFieldEggs), so hiding the world costs
@@ -3741,7 +3709,6 @@ local function main()
 	-- alive and scanned this server. Capped at PVF_MAX_WAIT, so it barely touches the hop.
 	local pvT0 = os.clock()
 	while (CONFIG.hubPending or 0) > 0 and os.clock() - pvT0 < 4 do task.wait(0.05) end
-	if CONFIG.sendCount then pcall(CONFIG.sendCount, scan(assets, eggState), #Players:GetPlayers()) end
 
 	-- Halloween Dimension: purely additive reporting. Its eggs are (almost)
 	-- always up, so the result is ignored and never gates a hop - and nothing
@@ -3752,7 +3719,7 @@ local function main()
 	-- Ping gate: eggs (if any) are already reported above, so a laggy server
 	-- can be skipped without losing anything. One GetNetworkPing read, so it
 	-- costs nothing measurable.
-	if CONFIG.MAX_PING_MS and CONFIG.MAX_PING_MS > 0 and not CONFIG.HOP_ONLY_ON_RARE then
+	if CONFIG.MAX_PING_MS and CONFIG.MAX_PING_MS > 0 then
 		local ping = avgPingMs()
 		if ping and ping > CONFIG.MAX_PING_MS then
 			log(("high ping %.0fms (want <=%dms) - hopping"):format(ping, CONFIG.MAX_PING_MS))
@@ -3834,8 +3801,6 @@ local function main()
 					log("holding for spawn wave")
 				elseif not huntActive() then
 					idleLog()
-				elseif CONFIG.HOP_ONLY_ON_RARE and not CONFIG.hasRare(hits) then
-					idleLog()
 				else
 					log(("all %d target egg(s) visible already reported (%d/%d) - hopping to search for fresh")
 						:format(#hits, players, CONFIG.SERVER_CAPACITY))
@@ -3864,8 +3829,6 @@ local function main()
 					notify("egg posted - hopping")
 					if hoppingPaused() then
 						log("target egg reported - holding for spawn wave")
-					elseif CONFIG.HOP_ONLY_ON_RARE and not CONFIG.hasRare(hits) then
-						idleLog()
 					else
 						if hop() then
 							return
@@ -3889,8 +3852,6 @@ local function main()
 			if hoppingPaused() then
 				log("holding for spawn wave")
 			elseif not huntActive() then
-				idleLog()
-			elseif CONFIG.HOP_ONLY_ON_RARE then
 				idleLog()
 			else
 				log("no target eggs on this server - hopping to search elsewhere")
