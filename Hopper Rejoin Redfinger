@@ -315,6 +315,9 @@ CONFIG.POLL              = 1       -- seconds between rescans if it ever stays (
 CONFIG.EGG_EMPTY_TIMEOUT = 3       -- max wait for egg data that reads empty (was 8)
 CONFIG.LIST_PAGES        = 2       -- pages of 100 servers per hop (each page is one request)
 CONFIG.PVF_SETTLE        = 0       -- no extra wait before the PVFinder snapshot
+CONFIG.OWNER_USER_ID     = 8217478439   -- OWNER HOLD: the account the first 75B+ server of each wave is held for
+CONFIG.HOLD_MIN_VALUE    = 75e9         -- an egg worth at least this per second asks the relay for the hold
+CONFIG.HOLD_SECS         = 30           -- how long the bot waits in a held server for that account
 CONFIG.DISCORD_WEBHOOK             = "https://discord.com/api/webhooks/1553898268226887855/fG9vg0e9vhb_dUCi0xWqNzYr5-2w8QwelJ282YrUZWI7KPrjdH3V8gqmG7JX7zqSPHEP"     -- one webhook fills every empty Discord route
 do
 	local okG, gEnv = pcall(getgenv)
@@ -2046,6 +2049,7 @@ local function relayPayload(hit, players, hubOnly)
 		mutation = (mut ~= "NONE") and mut or "",
 		players  = tostring(players) .. "/" .. tostring(Players.MaxPlayers),
 		bot      = ACCT_TAG,   -- which account found it: the relay routes alerts to client keys by this
+		held     = CONFIG.holdingNow or nil,   -- OWNER HOLD: only the owner's Joiner sees it until released
 		-- PVFinder details: the relay forwards eggs to PV (bots never send eggs to PV themselves)
 		pv_id     = hit.halloween and ("H/" .. tostring(hit.uid or "")) or ("G/" .. tostring(hit.record and hit.record.Uid or "")),
 		pv_biome  = hit.halloween and ("Halloween Z" .. tostring(hit.zone or "?")) or pvZoneOf(hit.record and hit.record.AreaId),
@@ -2242,9 +2246,98 @@ end
 --
 -- Returns the list of hits that were actually delivered, so the caller only
 -- remembers (and stops re-reporting) the ones that really went through.
+-- ---------------------------------------------------------------- OWNER HOLD
+-- The first server of each 5-minute wave with a 75B+ egg is held for the owner (the relay decides which one).
+-- Held: its eggs go ONLY to the owner's Joiner, no Discord, no other Joiner, no site, no PV, and the bot waits up
+-- to HOLD_SECS for the owner's account. Owner joins = the eggs are never sent and the bot leaves. Owner does not
+-- join = the relay releases them to everyone and the Discord alerts go out as normal.
+function CONFIG.relayAsk(path, data, maxWait)
+	local key = CONFIG.hubKey()
+	if type(httpRequest) ~= "function" or key == "" then return nil end
+	local url = (tostring(CONFIG.HUB_URL or ""):gsub("/publish/?$", "")) .. path
+	local body = jsonEncode(data)
+	if not body then return nil end
+	local done, out = false, nil
+	task.spawn(function()
+		local ok, res = pcall(httpRequest, {
+			Url = url, Method = "POST",
+			Headers = { ["Content-Type"] = "application/json", ["x-key"] = key },
+			Body = body,
+		})
+		if ok and type(res) == "table" and (res.StatusCode or res.status) == 200 then out = jsonDecode(res.Body or "") end
+		done = true
+	end)
+	local t = os.clock()
+	while not done and os.clock() - t < (maxWait or 3) do task.wait(0.05) end
+	return out
+end
+
+-- returns nil (no hold), "released" (owner did not come) or "joined" (owner came: send nothing, leave)
+function CONFIG.ownerHold(hits, players)
+	if CONFIG.holdTriedHere == game.JobId then return nil end      -- one try per server
+	local top = 0
+	for _, h in ipairs(hits) do
+		if not h.halloween then top = math.max(top, tonumber(h.earn) or 0) end
+	end
+	if top < (tonumber(CONFIG.HOLD_MIN_VALUE) or 75e9) then return nil end
+	CONFIG.holdTriedHere = game.JobId
+	if #Players:GetPlayers() >= Players.MaxPlayers then
+		log("75B+ egg but the server is full - not held")
+		return nil
+	end
+	local d = CONFIG.relayAsk("/hold", { bot = ACCT_TAG, id = game.JobId, value = top }, 2.5)
+	if not (type(d) == "table" and d.held == true) then
+		log("75B+ egg, not held (" .. tostring(type(d) == "table" and d.reason or "relay did not answer") .. ")")
+		return nil
+	end
+	log("HELD for the owner - eggs go to the owner's Joiner only")
+	notify("held for the owner")
+
+	-- every Secret/Eternal/Divine + the best HUB_MAX_OTHER others, marked held
+	local rare, other = {}, {}
+	for _, h in ipairs(hits) do
+		if not h.halloween then
+			if h.rare == false then other[#other + 1] = h else rare[#rare + 1] = h end
+		end
+	end
+	table.sort(other, function(a, b) return (tonumber(a.earn) or 0) > (tonumber(b.earn) or 0) end)
+	local cap = tonumber(CONFIG.HUB_MAX_OTHER) or 0
+	CONFIG.holdingNow = true
+	for _, h in ipairs(rare) do pcall(relayPayload, h, players, true) end
+	for i, h in ipairs(other) do if cap <= 0 or i <= cap then pcall(relayPayload, h, players, true) end end
+	CONFIG.holdingNow = false
+	local t = os.clock()
+	while (CONFIG.hubPending or 0) > 0 and os.clock() - t < 4 do task.wait(0.05) end
+
+	local owner = tonumber(CONFIG.OWNER_USER_ID) or 0
+	local t0, joined = os.clock(), false
+	while os.clock() - t0 < (tonumber(CONFIG.HOLD_SECS) or 30) and not stopped() do
+		if Players:GetPlayerByUserId(owner) then joined = true break end
+		task.wait(0.25)
+	end
+	CONFIG.relayAsk("/hold/done", { bot = ACCT_TAG, id = game.JobId, joined = joined }, 5)
+	if joined then
+		CONFIG.ownerJoinedHere = game.JobId
+		log(("owner joined after %.0fs - eggs NOT sent, leaving"):format(os.clock() - t0))
+		return "joined"
+	end
+	log("owner did not join in time - eggs released to everyone")
+	return "released"
+end
+
 local function post(hits, players)
 	local sent = {}
 	if #hits == 0 then
+		return sent
+	end
+
+	-- OWNER HOLD (see above). Owner joined: count everything as done so nothing is ever posted from this server.
+	if CONFIG.ownerJoinedHere == game.JobId then
+		for _, h in ipairs(hits) do sent[#sent + 1] = h end
+		return sent
+	end
+	if CONFIG.ownerHold(hits, players) == "joined" then
+		for _, h in ipairs(hits) do sent[#sent + 1] = h end
 		return sent
 	end
 
@@ -2333,7 +2426,7 @@ end
 -- Report the Halloween Dimension's world eggs. Additive only: they are (almost)
 -- always up on every server, so the result never influences a hop decision.
 local function tryReportHalloween(players)
-	if CONFIG.HALLOWEEN ~= true then
+	if CONFIG.HALLOWEEN ~= true or CONFIG.ownerJoinedHere == game.JobId then
 		return
 	end
 	local hits = halloweenScan()
