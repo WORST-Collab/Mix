@@ -318,6 +318,7 @@ CONFIG.PVF_SETTLE        = 0       -- no extra wait before the PVFinder snapshot
 CONFIG.OWNER_USER_ID     = 8217478439   -- OWNER HOLD: the account the first 75B+ server of each wave is held for
 CONFIG.HOLD_MIN_VALUE    = 75e9         -- an egg worth at least this per second asks the relay for the hold
 CONFIG.HOLD_SECS         = 30           -- how long the bot waits in a held server for that account
+CONFIG.DISCORD_MAX_VALUE = 20e9         -- Discord posts only for eggs worth up to this (20B/s). Bigger eggs still go to the relay (Joiner/site/PVIP). 0 = no limit
 CONFIG.DISCORD_WEBHOOK             = "https://discord.com/api/webhooks/1553898268226887855/fG9vg0e9vhb_dUCi0xWqNzYr5-2w8QwelJ282YrUZWI7KPrjdH3V8gqmG7JX7zqSPHEP"     -- one webhook fills every empty Discord route
 do
 	local okG, gEnv = pcall(getgenv)
@@ -2363,6 +2364,21 @@ local function post(hits, players)
 		end
 	end
 	hits = rareHits
+	-- Discord max value: eggs above DISCORD_MAX_VALUE go to the relay only (no Discord message, no ping)
+	local dmax = tonumber(CONFIG.DISCORD_MAX_VALUE) or 0
+	if dmax > 0 then
+		local keep = {}
+		for _, hit in ipairs(hits) do
+			if not hit.halloween and (tonumber(hit.earn) or 0) > dmax then
+				pcall(relayPayload, hit, players, true)   -- relay only
+				sent[#sent + 1] = hit
+				log(("%s over the Discord max - relay only"):format(tostring(hit.name)))
+			else
+				keep[#keep + 1] = hit
+			end
+		end
+		hits = keep
+	end
 	if #hits == 0 then
 		return sent
 	end
